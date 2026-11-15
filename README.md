@@ -90,6 +90,7 @@ conda install nvidia/label/cuda-12.4.1::cuda
 conda install -c nvidia/label/cuda-12.4.1 cudatoolkit
 sh setup_env.sh
 ```
+On aarch64 nodes (e.g. GB200 / GB300) skip the two `conda install` lines; `setup_env.sh` installs the matching wheels.
 
 ## Training
 **Create a new conda to quantize your own LLM with NVFP4**
@@ -115,6 +116,24 @@ python quantize_nvfp4.py --model Qwen/Qwen2.5-32B-Instruct
 ```
 bash training/dapo_qwen2.5-7b_nvfp4_single_gpu.sh
 ```
+**Training with QeRL on multiple GPUs**
+```
+MODEL_PATH=/path/to/your/NVFP4/model NUM_GPUS=4 bash training/dapo_qwen2.5-7b_nvfp4_multi_gpu.sh
+```
+Every GPU runs one process holding its own vLLM engine on the packed NVFP4 weights (plus the live LoRA) and its own NVFP4 training replica, so no fake quantization is involved; only the LoRA / RMSNorm gradients are averaged across GPUs. It works on any GPU supported by the single-GPU scripts (H100, B200, GB300, ...). The main knobs (environment variables or the variables at the top of the script):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NUM_GPUS` | 4 | Number of GPUs (processes) on the node. |
+| `PER_DEVICE_BATCH` | 8 | Completions per GPU in one forward/backward pass. |
+| `GRAD_ACCUM` | 4 | Accumulation steps. Completions per optimizer step = `PER_DEVICE_BATCH * NUM_GPUS * GRAD_ACCUM` (128 by default, i.e. 16 prompts x 8 generations); it must be a multiple of `num_generations`. |
+| `GRAD_CKPT` | True | Gradient checkpointing. `False` is slightly faster, but the memory of the policy update then grows with `PER_DEVICE_BATCH` x the longest completion, and a single very long completion can exhaust the GPU. |
+| `VLLM_MEM` | 0.3 | Fraction of each GPU reserved for the vLLM engine (weights + KV cache). |
+| `LR` | 3e-5 | Learning rate. |
+| `DATA_NAME` | gsm8k | Dataset (`gsm8k`, `dapomath`, `bigmath`, `codeforces`). |
+
+All completions of one optimizer step are generated at once and then grouped by length across the accumulation steps (with the padding trimmed), so a small `PER_DEVICE_BATCH` with more `GRAD_ACCUM` steps costs little and yields the same gradient.
+
 **Training with vanilla (16-bit) LoRA**
 ```
 bash training/dapo_qwen2.5-7b_bf16_single_gpu.sh
@@ -150,7 +169,8 @@ lm_eval --model hf \
     --batch_size 8
 
 # For model trained by QeRL, we give the evaluation code based on vLLM engine.
-python -m eval.gsm8k --model $MODEL_PATH --load nvfp4
+# $MODEL_PATH is a base model or a QeRL checkpoint (the adapter is applied unmerged on its NVFP4 base model).
+python -m eval.gsm8k --model $MODEL_PATH --data gsm8k
 
 ```
 

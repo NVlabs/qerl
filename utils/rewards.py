@@ -1,8 +1,8 @@
 import re
 import asyncio
 from datasets import Dataset, load_dataset
-from open_r1.utils.math_dapo import compute_score
-from open_r1.utils.code_providers import get_provider
+from utils.math_dapo import compute_score
+from utils.code_providers import get_provider
 import json
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
