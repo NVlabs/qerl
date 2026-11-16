@@ -41,7 +41,7 @@ def get_gsm8k_questions(split = "train") -> Dataset:
     # """
     data = data.map(lambda x: { # type: ignore
         'prompt': [
-            # {'role': 'system', 'content': system_prompt},
+            {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': x['question']}
         ],
         'answer': extract_hash_answer(x['answer'])

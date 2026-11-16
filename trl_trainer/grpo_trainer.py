@@ -14,13 +14,16 @@
 
 import copy
 import inspect
+import logging
 import os
 import re
 import textwrap
+import time
 import warnings
 from collections import defaultdict, deque
 from collections.abc import Sequence, Sized
 from contextlib import nullcontext
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
@@ -29,7 +32,6 @@ import datasets
 import torch
 import torch.utils.data
 import transformers
-import numpy as np
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from datasets import Dataset, IterableDataset
 from torch import nn
@@ -50,14 +52,6 @@ from transformers import (
 )
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_flash_attn_2_available, is_peft_available, is_rich_available
-from collections import OrderedDict
-import re
-import time
-from dataclasses import asdict
-from vllm.lora.models import LoRAModel
-from vllm.lora.request import LoRARequest
-from peft.utils.save_and_load import get_peft_model_state_dict
-from dataclasses import field
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.extras.profiling import profiling_context, profiling_decorator
 from trl.extras.vllm_client import VLLMClient
@@ -75,11 +69,13 @@ from trl.trainer.utils import (
     print_prompt_completions_sample,
     selective_log_softmax,
 )
-from .noise_scheduler import generate_gaussian_noise
+from .noise_scheduler import AdaptiveQuantizationNoise
+from .runtime_patches import apply_patches, make_tensor_lora_request_cls
 
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
+    from peft.utils.save_and_load import get_peft_model_state_dict
 
 if is_liger_kernel_available():
     from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
@@ -88,6 +84,9 @@ if is_vllm_available():
     from vllm import LLM, SamplingParams
     from vllm.sampling_params import GuidedDecodingParams
 
+    apply_patches()
+    TensorLoRARequest = make_tensor_lora_request_cls()
+
 if is_wandb_available():
     import wandb
 
@@ -95,9 +94,8 @@ if is_wandb_available():
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
-class TensorLoRARequest(LoRARequest):
-    peft_config: dict = field(default=None)
-    lora_tensors: dict = field(default=None)
+logger = logging.getLogger(__name__)
+
 
 class RepeatSampler(Sampler):
     """
@@ -244,6 +242,34 @@ def split_tensor_dict(
         }
         for i in range(num_chunks)
     ]
+
+
+def sort_sequence_dict(seq_dict: dict[str, Optional[Sequence]], keys: torch.Tensor) -> dict[str, Optional[Sequence]]:
+    """Reorders all sequence-like values in a dictionary along the first dimension, by increasing `keys`."""
+    permutation = torch.argsort(keys.cpu(), stable=True)
+
+    def permute(v: Optional[Sequence]) -> Optional[Sequence]:
+        if v is None:
+            return None
+        if isinstance(v, torch.Tensor):
+            return v[permutation.to(v.device)]
+        return [v[i] for i in permutation]
+
+    return {key: permute(val) for key, val in seq_dict.items()}
+
+
+def trim_padding(batch: dict[str, Optional[torch.Tensor]]) -> dict[str, Optional[torch.Tensor]]:
+    """Drops the columns that are padding for every row of the batch (prompts are left-padded, completions are
+    right-padded)."""
+    prompt_length = max(int(batch["prompt_mask"].sum(dim=1).max()), 1)
+    completion_length = max(int(batch["completion_mask"].sum(dim=1).max()), 1)
+    batch = dict(batch)
+    for key in ("prompt_ids", "prompt_mask"):
+        batch[key] = batch[key][:, -prompt_length:]
+    for key in ("completion_ids", "completion_mask", "old_per_token_logps", "ref_per_token_logps"):
+        if batch.get(key) is not None:
+            batch[key] = batch[key][:, :completion_length]
+    return batch
 
 
 def shuffle_sequence_dict(seq_dict: dict[str, Optional[Sequence]]) -> dict[str, Optional[Sequence]]:
@@ -521,9 +547,13 @@ class GRPOTrainer(Trainer):
         num_stages: Optional[int] = None,
         noise_scheduler: Optional[bool] = None,
     ):
-        self.sigma_start = sigma_start
-        self.sigma_end = sigma_end
-        self.num_stages = num_stages
+        # Adaptive quantization noise applied to the rollout policy (see `noise_scheduler.py`).
+        self.aqn = None
+        if noise_scheduler:
+            if sigma_start is None or sigma_end is None or num_stages is None:
+                raise ValueError("`sigma_start`, `sigma_end` and `num_stages` are required with `noise_scheduler`.")
+            seed = args.seed if args is not None else 0
+            self.aqn = AdaptiveQuantizationNoise(sigma_start, sigma_end, num_stages, seed=seed)
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
@@ -570,13 +600,10 @@ class GRPOTrainer(Trainer):
             if not is_peft_available():
                 raise ImportError("PEFT is required to use `peft_config`. Run `pip install peft`.")
             model = get_peft_model(model, peft_config)
-            trainable, total = 0, 0
-            for n, p in model.named_parameters():
-                total += p.numel()
-                if p.requires_grad:
-                    trainable += p.numel()
-            print(f"Trainable params: {trainable/1e6:.2f}M / {total/1e6:.2f}M")
-        
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in model.parameters())
+            logger.info(f"Trainable params: {trainable / 1e6:.2f}M / {total / 1e6:.2f}M")
+
         # Enable gradient checkpointing if requested
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
@@ -671,8 +698,11 @@ class GRPOTrainer(Trainer):
         self.importance_sampling_level = args.importance_sampling_level
         self.mask_truncated_completions = args.mask_truncated_completions
         self.top_entropy_quantile = args.top_entropy_quantile
-        self.noise_scheduler = noise_scheduler
-        self.unmerged_lora = True
+        # Keep the LoRA adapter separate from the base weights in the rollout engine. This is what allows the
+        # base model to stay in its packed NVFP4 form in vLLM: merging would require dense weights.
+        self.unmerged_lora = peft_config is not None or is_peft_model(model)
+        self._vllm_lora_request = None
+        self._vllm_lora_counter = 0
         if self.use_liger_loss and self.top_entropy_quantile < 1.0:
             raise NotImplementedError(
                 "Liger Kernels don't currently support masking token positions based on entropy."
@@ -832,7 +862,9 @@ class GRPOTrainer(Trainer):
                     max_model_len = self.max_prompt_length + self.max_completion_length
                 else:
                     max_model_len = None
-                self.max_lora_rank = 32
+                if self.unmerged_lora:
+                    lora_ranks = [cfg.r for cfg in model.peft_config.values() if hasattr(cfg, "r")]
+                    self.max_lora_rank = max(lora_ranks)
                 self.llm = LLM(
                     model=model.name_or_path,
                     tensor_parallel_size=args.vllm_tensor_parallel_size,
@@ -847,10 +879,10 @@ class GRPOTrainer(Trainer):
                     # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
                     max_num_batched_tokens=4096,
                     model_impl=self.args.vllm_model_impl,
-                    enable_lora=True if self.unmerged_lora else False,
+                    enable_lora=self.unmerged_lora,
                     max_lora_rank=self.max_lora_rank if self.unmerged_lora else None,
+                    max_loras=1,
                     enable_sleep_mode=self.args.vllm_enable_sleep_mode,
-                    # enforce_eager=True,
                 )
                 if self.args.vllm_enable_sleep_mode:
                     self.llm.sleep(level=1)
@@ -1149,7 +1181,8 @@ class GRPOTrainer(Trainer):
             logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
             # Divide logits by sampling temperature.
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            logits = logits / self.temperature
+            if self.temperature != 1.0:  # skip the full-size copy (kept alive for backprop) in the common case
+                logits = logits / self.temperature
 
             completion_ids = input_ids_batch[:, -logits_to_keep:]
             logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
@@ -1287,91 +1320,72 @@ class GRPOTrainer(Trainer):
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
     
+    def _vllm_model(self) -> nn.Module:
+        """The model held by the colocated vLLM engine of this process."""
+        return self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+
     @profiling_decorator
     def _move_peft_model_to_vllm(self):
-        # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
+        """Sync the trainable weights to the colocated vLLM engine *without* merging the adapter.
+
+        The LoRA matrices are registered as a vLLM adapter directly from memory and the fully trained modules
+        (`modules_to_save`, e.g. the RMSNorm weights) overwrite their vLLM counterparts. The quantized base
+        weights are never touched, so the rollout keeps running on packed NVFP4 weights.
+
+        In a distributed run every process holds its own engine and calls this for itself; the trainable
+        weights are identical on all processes after each optimizer step, so no communication is needed.
+        """
+        if self.vllm_mode != "colocate":
+            raise NotImplementedError("Unmerged LoRA rollouts are only supported with `vllm_mode='colocate'`.")
+        if self.is_fsdp_enabled:
+            raise NotImplementedError("Unmerged LoRA rollouts are not supported with FSDP; use DDP instead.")
+
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
-        zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
-        if zero_stage_3:
+        if deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3:
             import deepspeed
 
             gather_if_zero3 = deepspeed.zero.GatheredParameters
         else:
             gather_if_zero3 = nullcontext
 
-        if is_peft_model(self.model):
-            # With PEFT and FSDP/DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as
-            # merging adapters in a sharded manner is not supported.
-            # TODO: does this work with FSDP?
-            peft_config = None
-            with gather_if_zero3(list(self.model.parameters())):
-                peft_config = self.model.peft_config.get("default", None)
-                peft_params = get_peft_model_state_dict(self.model)
-                # Filter out keys that don't contain "lora"
-                # Update vLLM weights while parameters are gathered
-                if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
-                    # Update vLLM weights while parameters are gathered
-                    # For PEFT with FSDP we need to use the memory efficient post-order traversal
-                    self._sync_fsdp_params_to_vllm(self.model)
+        model = self.accelerator.unwrap_model(self.model)
+        llm_model = self._vllm_model()
+        synced_modules = set()
+        with gather_if_zero3(list(model.parameters())):
+            lora_tensors = {}
+            for name, param in get_peft_model_state_dict(model).items():
+                if "lora_" in name:
+                    lora_tensors[name] = param.detach().clone()
                 else:
-                    # Unmerge adapters while parameters are still gathered
-                    deleted_names = []
-                    for name, param in peft_params.items():
-                        with gather_if_zero3([param]):
-                            if 'layernorm' in name:
-                                llm_model_name = name.replace('base_model.model.', '')
-                                if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                                    self.vllm_client.update_named_param(llm_model_name, param.data)
-                                elif self.vllm_mode == "colocate":
-                                    llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                                    llm_model.load_weights([(llm_model_name, param.data)])
-                                # delete the param from peft_params
-                                deleted_names.append(name)
-                                
-                    for name in deleted_names:
-                        del peft_params[name]
-                    peft_config.modules_to_save = None
+                    vllm_name = self._fix_param_name_to_vllm(name.removeprefix("base_model.model."))
+                    llm_model.load_weights([(vllm_name, param.data)])
+                    synced_modules.add(vllm_name.rpartition(".")[0])
 
-                    lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
-                    # self.model.save_pretrained(f"/FirstIntelligence/home/yige/code/open-r1/lora_adapter/{lora_int_id}")
-                    lora_reqest = TensorLoRARequest(
-                        lora_name=f"{lora_int_id}",
-                        lora_int_id=lora_int_id,
-                        lora_path="simon_lora_path",
-                        peft_config=asdict(peft_config),
-                        lora_tensors=peft_params,
-                    )
-                    # print(peft_params)
+        # vLLM has no notion of `modules_to_save` (and rejects adapters declaring it); those were synced above.
+        # Work on a copy: the live config is saved with every checkpoint.
+        peft_config = asdict(model.peft_config["default"])
+        peft_config["modules_to_save"] = None
 
-                    self.llm.llm_engine.add_lora(lora_reqest)
-                    # print(f"vLLM load peft weights, loaded_params: {len(peft_params)}")
+        # A new id per sync makes the engine drop the stale adapter (and its cached activations).
+        self._vllm_lora_counter += 1
+        lora_int_id = self._vllm_lora_counter
+        previous = self._vllm_lora_request
+        self._vllm_lora_request = TensorLoRARequest(
+            lora_name=f"qerl-{lora_int_id}",
+            lora_int_id=lora_int_id,
+            lora_path="in-memory",
+            peft_config=peft_config,
+            lora_tensors=lora_tensors,
+        )
+        if previous is not None:
+            self.llm.llm_engine.remove_lora(previous.lora_int_id)
+        self.llm.llm_engine.add_lora(self._vllm_lora_request)
 
-        else:
-            # For non-PEFT models, simply gather (if needed) and update each parameter individually.
-            if self.is_fsdp_enabled:
-                self._sync_fsdp_params_to_vllm(self.model)  # use memory-efficient post-order traversal for FSDP
-            else:
-                for name, param in self.model.named_parameters():
-                    with gather_if_zero3([param]):
-                        if 'input_layernorm' in name:
-                            print(name)
-                            print(param.data)
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
-        if self.noise_scheduler:
-            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-            sigma_decay_schedule_np =  self.sigma_start * (self.sigma_end / self.sigma_start) ** (np.arange(self.num_stages - 1) / (self.num_stages - 2))
-            sigma_trend = sigma_decay_schedule_np.tolist()
-            print(sigma_trend, self.update_step, self.total_steps)
-            generate_gaussian_noise(llm_model, self.update_step, self.total_steps, sigma_trend)
-        # Reset cache on vLLM
-        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-            self.vllm_client.reset_prefix_cache()
-        elif self.vllm_mode == "colocate":
-            self.llm.reset_prefix_cache()
+        if self.aqn is not None:
+            sigma = self.aqn.apply(llm_model, self.state.global_step, self.state.max_steps, synced=synced_modules)
+            self._metrics["train"]["aqn_sigma"].append(sigma)
+
+        self.llm.reset_prefix_cache()
 
     @profiling_decorator
     def _prepare_inputs(
@@ -1397,8 +1411,24 @@ class GRPOTrainer(Trainer):
                 # self._buffered_inputs=None can occur when resuming from a checkpoint
                 generation_batch = self._generate_and_score_completions(generation_batch)
                 generation_batch = split_pixel_values_by_grid(generation_batch)
-                generation_batch = shuffle_sequence_dict(generation_batch)
+                # The policy update pads every batch to its longest sequence, so the cost of a step is set by
+                # the longest completion. When all the batches of this generation go into the same optimizer step
+                # their composition does not matter: group completions of similar length together and drop the
+                # padding each batch does not need. Otherwise keep the batches i.i.d.
+                group_by_length = self.args.gradient_accumulation_steps % self.args.steps_per_generation == 0
+                if group_by_length:
+                    lengths = generation_batch["completion_mask"].sum(dim=1)
+                    generation_batch = sort_sequence_dict(generation_batch, lengths)
+                else:
+                    generation_batch = shuffle_sequence_dict(generation_batch)
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                if group_by_length:
+                    # Token-level losses are averaged over the completion tokens of the whole generation (not of
+                    # each batch), so that the gradient does not depend on how it is split into batches.
+                    tokens_per_batch = lengths.sum() / self.args.steps_per_generation
+                    generation_batches = [
+                        {**trim_padding(batch), "completion_tokens": tokens_per_batch} for batch in generation_batches
+                    ]
                 self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
             inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
             self._step += 1
@@ -1540,7 +1570,12 @@ class GRPOTrainer(Trainer):
                 self.llm.wake_up()
             
             if self.state.global_step != self._last_loaded_step:
-                self._move_model_to_vllm() if not self.unmerged_lora else self._move_peft_model_to_vllm()
+                sync_start = time.perf_counter()
+                if self.unmerged_lora:
+                    self._move_peft_model_to_vllm()
+                else:
+                    self._move_model_to_vllm()
+                self._metrics[mode]["time/weight_sync_s"].append(time.perf_counter() - sync_start)
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
@@ -1633,21 +1668,24 @@ class GRPOTrainer(Trainer):
                             vllm_inputs.append(prompt)
                 else:
                     vllm_inputs = all_prompts_text
-                # from IPython import embed; embed()
                 lora_requests = None
-                lora_int_ids = list(self.llm.llm_engine.list_loras())
-                if len(lora_int_ids) > 0:
-                    lora_int_id = lora_int_ids[0]
-                    lora_requests = [LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="simon_stub_path")] * len(vllm_inputs)
-                
+                if self._vllm_lora_request is not None:
+                    lora_requests = [self._vllm_lora_request] * len(vllm_inputs)
+
                 with profiling_context(self, "vLLM.generate"):
-                    start_time = time.time()
-                    all_outputs = self.llm.generate(vllm_inputs, sampling_params=sampling_params, lora_request=lora_requests, use_tqdm=False)
-                    end_time = time.time()
+                    start_time = time.perf_counter()
+                    all_outputs = self.llm.generate(
+                        vllm_inputs, sampling_params=sampling_params, lora_request=lora_requests, use_tqdm=False
+                    )
+                    rollout_time = time.perf_counter() - start_time
                 completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
-                total_time = end_time - start_time
-                total_tokens = sum(len(ids) for ids in completion_ids)
-                print(f"vLLM.generate time: {total_time} seconds, total tokens: {total_tokens}, speed: {total_tokens / total_time} tokens/s")
+                rollout_tokens = sum(len(ids) for ids in completion_ids)
+                # The step waits for the slowest process, i.e. for the GPU that drew the longest completion.
+                rollout_times = gather(torch.tensor([rollout_time], device=device))
+                self._metrics[mode]["time/rollout_s"].append(rollout_times.max().item())
+                # Rollout throughput summed over all processes (each one drives its own engine).
+                throughput = torch.tensor([rollout_tokens / max(rollout_time, 1e-9)], device=device)
+                self._metrics[mode]["rollout_tokens_per_second"].append(gather(throughput).sum().item())
                 if self.vllm_tensor_parallel_size > 1:
                     # Slice completions for this rank within its TP group.
                     # Each rank generates all outputs — we keep only our share.
@@ -1662,8 +1700,7 @@ class GRPOTrainer(Trainer):
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.pad_token_id)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-            # self.model.to(device)
-        
+
         elif self.use_transformers_paged:
             # Re-process inputs for paged generation if needed
             # Note: images are already validated and preprocessed above
@@ -2024,7 +2061,8 @@ class GRPOTrainer(Trainer):
         if self.loss_type == "grpo":
             loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
         elif self.loss_type == "bnpo":
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            completion_tokens = inputs.get("completion_tokens", completion_mask.sum())
+            loss = (per_token_loss * completion_mask).sum() / completion_tokens.clamp(min=1.0)
         elif self.loss_type == "dr_grpo":
             loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
         else:
